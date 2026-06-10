@@ -1,42 +1,36 @@
 #!/usr/bin/env python3
 """
-
 Signal-IRC Bridge Bot
 
-Bridges messages between multiple Signal contacts/groups and an IRC channel
+Bridges messages between multiple Signal contacts/groups and one or more IRC
+channels over SSL.
 
-Admin commands (via IRC private message to the bot):
-    help                    - Show available commands
-    list                    - List active targets
-    add <id> [name]         - Add a target (phone number or group ID)
-    remove <id>             - Remove a target
-    status                  - Show bridge status
-    save                    - Save current targets to state file
-    join <channel> [key]    - Join an IRC channel (with optional key)
-    part [channel]          - Part an IRC channel (default: current channel)
-
-Configuration:
-    Can be provided via environment variables or an INI config file.
-    For INI file format, see example_config.ini.
+Each Signal target (contact or group) is bound to one or more IRC channels:
+- Bind several targets to the same channel to merge chats into one channel.
+- Bind one target to several channels to mirror a Signal chat across channels.
+- Bind targets to distinct channels for independent, isolated bridges.
+Targets with no channel set fall back to the default [irc] channel.
 
 Requirements:
-    - Python 3.8+
-    - aiohttp
-    - irc (irc.client_aio)
-    - signal-cli-rest-api running and configured with your Signal account (phone number)
+- signal-cli-rest-api running in json-rpc mode
+  (https://github.com/bbernhard/signal-cli-rest-api)
+- Python 3.10+
+
+Signal -> IRC: Messages relayed as "<sender> message" or "[TargetName] <sender> message"
+IRC -> Signal: Relayed to the Signal target(s) bound to the originating channel.
+    By default only messages prefixed with "botname:" are forwarded; set
+    forward_all_messages = true to forward every channel message.
+
+Admin commands (via IRC private message to the bot):
+    help                       - Show available commands
+    list                       - List active targets and their channels
+    add <id> [name] [#chan...] - Add a target (phone number or group ID)
+    remove <id>                - Remove a target
+    channels <id> [#chan...]   - Set/clear a target's IRC channels
+    status                     - Show bridge status
 
 Usage:
     python signalbridgebot.py --config config.ini
-    Or set environment variables and run without arguments.
-
-This bot is designed to be run continuously, ideally in a screen/tmux session or as a 
-systemd service. 
-
-It will automatically reconnect to IRC if the connection is lost and will poll 
-the signal-cli-rest-api for new messages.
-
-This program is provided as-is, without warranty of any kind. Use at your own risk.
-                                                                            --morb
 """
 
 import argparse
@@ -61,15 +55,20 @@ import irc.connection
 @dataclass
 class Target:
     """A Signal target (contact or group)"""
-    id: str
-    internal_id: str = ""
-    name: str = ""  
+    id: str  # Phone number or group ID (for sending - use the group.XXX= format)
+    internal_id: str = ""  # For groups: the internal_id used in incoming messages
+    name: str = ""  # Optional friendly name - if set, shown as prefix on IRC
     is_group: bool = False
     enabled: bool = True
+    # IRC channels this target bridges to. Empty -> falls back to the default
+    # channel (config.irc_channel). List multiple channels to mirror one Signal
+    # chat to several IRC channels.
+    channels: list[str] = field(default_factory=list)
     message_count: int = 0
     last_message: Optional[datetime] = None
-    
+
     def __post_init__(self):
+        # Auto-detect group by ID format
         if not self.is_group and (self.id.startswith("group.") or self.internal_id):
             self.is_group = True
 
@@ -83,8 +82,10 @@ class Target:
             d["name"] = self.name
         if self.internal_id:
             d["internal_id"] = self.internal_id
+        if self.channels:
+            d["channels"] = self.channels
         return d
-    
+
     @classmethod
     def from_dict(cls, data: dict) -> "Target":
         return cls(
@@ -93,17 +94,21 @@ class Target:
             name=data.get("name", ""),
             is_group=data.get("is_group", False),
             enabled=data.get("enabled", True),
+            channels=list(data.get("channels", [])),
         )
 
 
 @dataclass
 class Config:
     """Bridge configuration"""
+    # Signal settings (signal-cli-rest-api)
     signal_api_url: str = "http://localhost:8080"
     signal_phone_number: str = ""
     
+    # Multiple targets
     targets: dict[str, Target] = field(default_factory=dict)
     
+    # IRC settings
     irc_server: str = "irc.libera.chat"
     irc_port: int = 6697
     irc_use_ssl: bool = True
@@ -112,11 +117,21 @@ class Config:
     irc_channel: str = "#signal-bridge"
     irc_password: str = ""
     irc_nickserv_password: str = ""
-    
+
+    # Admin settings
     admin_masks: list[str] = field(default_factory=list)
-    
+
+    # Bridge settings
     rate_limit_ms: int = 500
-    
+    # Prefix prepended to every Signal -> IRC message (e.g. a leading marker)
+    signal_prefix: str = ""
+    # Forward every IRC channel message to Signal, not just "<nick>:"-prefixed ones
+    forward_all_messages: bool = False
+    # Echo IRC messages between the channels of a target that maps to several
+    # channels (IRC<->IRC mirroring). Off -> channels are independent.
+    mirror_channels: bool = False
+
+    # State file for dynamic targets
     state_file: str = ""
 
     def add_target(self, target: Target):
@@ -149,6 +164,40 @@ class Config:
         if source in self.targets:
             return self.targets[source]
         return None
+
+    def channels_for_target(self, target: Target) -> list[str]:
+        """IRC channels a Signal target relays to (its own, or the default)."""
+        return target.channels if target.channels else [self.irc_channel]
+
+    def all_channels(self) -> list[str]:
+        """Every IRC channel the bot must join: the default plus all targets'."""
+        ordered: list[str] = []
+        for chan in [self.irc_channel, *(c for t in self.targets.values() for c in t.channels)]:
+            if chan and chan not in ordered:
+                ordered.append(chan)
+        return ordered
+
+    def targets_for_channel(self, channel: str) -> list[Target]:
+        """Enabled Signal targets that bridge the given IRC channel."""
+        return [
+            t for t in self.targets.values()
+            if t.enabled and channel in self.channels_for_target(t)
+        ]
+
+    def mirror_channels_for(self, channel: str) -> list[str]:
+        """Other IRC channels that should mirror a message seen in `channel`.
+
+        The union of all channels of every target bridging `channel`, minus
+        `channel` itself. Empty unless mirror_channels is enabled.
+        """
+        if not self.mirror_channels:
+            return []
+        dests: list[str] = []
+        for target in self.targets_for_channel(channel):
+            for chan in self.channels_for_target(target):
+                if chan != channel and chan not in dests:
+                    dests.append(chan)
+        return dests
 
     def save_state(self):
         """Save dynamic state to file"""
@@ -190,6 +239,9 @@ class Config:
             irc_password=os.getenv("IRC_PASSWORD", ""),
             irc_nickserv_password=os.getenv("IRC_NICKSERV_PASSWORD", ""),
             rate_limit_ms=int(os.getenv("RATE_LIMIT_MS", "500")),
+            signal_prefix=os.getenv("SIGNAL_PREFIX", ""),
+            forward_all_messages=os.getenv("FORWARD_ALL_MESSAGES", "false").lower() == "true",
+            mirror_channels=os.getenv("MIRROR_CHANNELS", "false").lower() == "true",
             state_file=os.getenv("STATE_FILE", ""),
         )
         
@@ -197,12 +249,20 @@ class Config:
         if admin_masks:
             cfg.admin_masks = [m.strip() for m in admin_masks.split(",")]
         
+        # SIGNAL_TARGETS: comma-separated targets. Append "@#chan1+#chan2" to a
+        # target to bind it to specific IRC channels, e.g. "+15551234567@#room".
         targets_str = os.getenv("SIGNAL_TARGETS", "")
         if targets_str:
             for t in targets_str.split(","):
                 t = t.strip()
-                if t:
-                    cfg.add_target(Target(id=t))
+                if not t:
+                    continue
+                channels: list[str] = []
+                if "@" in t:
+                    t, _, chans = t.partition("@")
+                    t = t.strip()
+                    channels = [c.strip() for c in chans.split("+") if c.strip()]
+                cfg.add_target(Target(id=t, channels=channels))
         
         cfg.load_state()
         return cfg
@@ -211,31 +271,50 @@ class Config:
     def from_file(cls, path: str) -> "Config":
         """Load configuration from INI file"""
         parser = configparser.ConfigParser()
+        # Preserve case for option names (important for base64 group IDs)
         parser.optionxform = str
         parser.read(path)
         
         cfg = cls()
-        
+
+        # Blank-tolerant readers: a present-but-empty value (common in template
+        # configs, e.g. "port =") falls back to the default instead of erroring.
+        def _str(section, key, fallback):
+            return section.get(key, "").strip() or fallback
+
+        def _int(section, key, fallback):
+            val = section.get(key, "").strip()
+            return int(val) if val else fallback
+
+        def _bool(section, key, fallback):
+            val = section.get(key, "").strip().lower()
+            if not val:
+                return fallback
+            return val in ("1", "true", "yes", "on")
+
         if "signal" in parser:
             s = parser["signal"]
-            cfg.signal_api_url = s.get("api_url", cfg.signal_api_url)
-            cfg.signal_phone_number = s.get("phone_number", "")
-        
+            cfg.signal_api_url = _str(s, "api_url", cfg.signal_api_url)
+            cfg.signal_phone_number = _str(s, "phone_number", "")
+
         if "irc" in parser:
             i = parser["irc"]
-            cfg.irc_server = i.get("server", cfg.irc_server)
-            cfg.irc_port = i.getint("port", cfg.irc_port)
-            cfg.irc_use_ssl = i.getboolean("use_ssl", cfg.irc_use_ssl)
-            cfg.irc_verify_ssl = i.getboolean("verify_ssl", cfg.irc_verify_ssl)
-            cfg.irc_nick = i.get("nick", cfg.irc_nick)
-            cfg.irc_channel = i.get("channel", cfg.irc_channel)
-            cfg.irc_password = i.get("password", cfg.irc_password)
-            cfg.irc_nickserv_password = i.get("nickserv_password", cfg.irc_nickserv_password)
-        
+            cfg.irc_server = _str(i, "server", cfg.irc_server)
+            cfg.irc_port = _int(i, "port", cfg.irc_port)
+            cfg.irc_use_ssl = _bool(i, "use_ssl", cfg.irc_use_ssl)
+            cfg.irc_verify_ssl = _bool(i, "verify_ssl", cfg.irc_verify_ssl)
+            cfg.irc_nick = _str(i, "nick", cfg.irc_nick)
+            cfg.irc_channel = _str(i, "channel", cfg.irc_channel)
+            cfg.irc_password = _str(i, "password", cfg.irc_password)
+            cfg.irc_nickserv_password = _str(i, "nickserv_password", cfg.irc_nickserv_password)
+
         if "bridge" in parser:
             b = parser["bridge"]
-            cfg.rate_limit_ms = b.getint("rate_limit_ms", cfg.rate_limit_ms)
-            cfg.state_file = b.get("state_file", cfg.state_file)
+            cfg.rate_limit_ms = _int(b, "rate_limit_ms", cfg.rate_limit_ms)
+            cfg.signal_prefix = b.get("signal_prefix", cfg.signal_prefix)
+            cfg.forward_all_messages = _bool(b, "forward_all_messages", cfg.forward_all_messages)
+            cfg.mirror_channels = _bool(b, "mirror_channels", cfg.mirror_channels)
+            cfg.state_file = _str(b, "state_file", cfg.state_file)
         
         if "admin" in parser:
             a = parser["admin"]
@@ -243,20 +322,28 @@ class Config:
             if masks:
                 cfg.admin_masks = [m.strip() for m in masks.split(",")]
         
+        # Load targets - format: id = [internal:X] [group] [channels:#a #b] [name]
+        # The id should be the group.XXX= format for sending.
+        # internal_id is the base64 ID used in incoming messages (optional, for groups).
+        # channels: binds this target to specific IRC channel(s), space-separated.
+        #   Omit to use the default [irc] channel. List several to mirror one
+        #   Signal chat across multiple IRC channels.
         if "targets" in parser:
             for line in parser["targets"]:
                 raw_value = parser["targets"][line]
                 target_id = line
                 value = raw_value
-                
+
+                # Handle base64 IDs with = padding that got split
                 while value.startswith("="):
                     target_id += "="
                     value = value[1:].lstrip()
-                
+
                 is_group = False
                 name = ""
                 internal_id = ""
-                
+                channels: list[str] = []
+
                 if value:
                     parts = [p.strip() for p in value.split(",")]
                     for part in parts:
@@ -264,11 +351,19 @@ class Config:
                             is_group = True
                         elif part.startswith("internal:"):
                             internal_id = part[9:].strip()
+                        elif part.startswith("channels:"):
+                            channels = [c.strip() for c in part[9:].split() if c.strip()]
                         elif part:
                             name = part
-                
+
                 if target_id:
-                    cfg.add_target(Target(id=target_id, internal_id=internal_id, name=name, is_group=is_group))
+                    cfg.add_target(Target(
+                        id=target_id,
+                        internal_id=internal_id,
+                        name=name,
+                        is_group=is_group,
+                        channels=channels,
+                    ))
         
         cfg.load_state()
         return cfg
@@ -285,6 +380,7 @@ class SignalClient:
         self._running = False
         self._message_callback = None
         self.logger = logging.getLogger("signal")
+        self._processed_messages = set()  # Track processed message IDs to avoid duplicates
     
     async def start(self):
         self._session = aiohttp.ClientSession()
@@ -308,6 +404,7 @@ class SignalClient:
         
         url = f"{self.api_url}/v2/send"
         
+        # For groups, the recipient ID needs "group." prefix if not already present
         recipient_id = target.id
         if target.is_group and not recipient_id.startswith("group."):
             recipient_id = f"group.{recipient_id}"
@@ -332,15 +429,6 @@ class SignalClient:
         except Exception as e:
             self.logger.error(f"Error sending message: {e}")
             return False
-    
-    async def send_to_all(self, text: str) -> int:
-        sent = 0
-        for target in self.config.targets.values():
-            if target.enabled:
-                if await self.send_message(target, text):
-                    sent += 1
-                await asyncio.sleep(self.config.rate_limit_ms / 1000)
-        return sent
     
     async def poll_loop(self):
         url = f"{self.api_url}/v1/receive/{self.phone_number}"
@@ -378,6 +466,28 @@ class SignalClient:
         
         envelope = msg.get("envelope", msg)
         
+        # Get unique message identifier for deduplication
+        message_id = envelope.get("timestamp")
+        if not message_id:
+            # Fallback to combination of source and message content if timestamp not available
+            source = envelope.get("source") or envelope.get("sourceNumber", "")
+            data_message = envelope.get("dataMessage", {})
+            text = data_message.get("message", "")
+            message_id = f"{source}_{text}"
+        
+        # Skip if already processed
+        if message_id in self._processed_messages:
+            self.logger.debug(f"Duplicate message skipped: {message_id}")
+            return
+        self._processed_messages.add(message_id)
+        
+        # Keep only last 1000 processed messages to prevent memory issues
+        if len(self._processed_messages) > 1000:
+            # Remove oldest messages
+            to_remove = len(self._processed_messages) - 1000
+            for _ in range(to_remove):
+                self._processed_messages.pop()
+        
         source = envelope.get("source") or envelope.get("sourceNumber", "")
         source_uuid = envelope.get("sourceUuid", "")
         if source == self.phone_number:
@@ -391,6 +501,7 @@ class SignalClient:
             self.logger.debug(f"No text content in message: {list(envelope.keys())}")
             return
         
+        # Get sender's display name from Signal
         source_name = envelope.get("sourceName") or source or source_uuid
         
         group_info = data_message.get("groupInfo", {})
@@ -431,6 +542,11 @@ class IRCBridge:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.logger = logging.getLogger("irc")
         self.current_nick = config.irc_nick
+        self._message_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+        self._reconnecting = False
+        self._reconnect_lock = asyncio.Lock()
+        self._seen_messages: set[str] = set()  # For ZNC replay deduplication
+        self._last_connect_time: float = 0
 
     async def start(self):
         self._running = True
@@ -480,32 +596,56 @@ class IRCBridge:
     def on_admin(self, callback):
         self._admin_callback = callback
     
-    async def send_message(self, sender_name: str, text: str, target_name: str = ""):
+    @staticmethod
+    def _format_lines(sender_name: str, text: str, target_name: str = "", prefix: str = "") -> list[str]:
+        """Build IRC-ready lines (split to fit message length limits).
+
+        If target_name is set, display as: [TargetName] <sender> message
+        Otherwise just: <sender> message. `prefix` is prepended to every line.
         """
-        Send a message to the channel.
-        
-        If target_name is set (from config), display as: [TargetName] <sender> message
-        Otherwise just: <sender> message
-        """
-        if not self.connection or not self.connection.is_connected():
-            self.logger.error("Not connected to IRC")
-            return
-        
         max_len = 400
+        lines_to_send: list[str] = []
         for line in text.split("\n"):
             if target_name:
-                line_formatted = f"[{target_name}] <{sender_name}> {line}"
+                line_formatted = f"{prefix}[{target_name}] <{sender_name}> {line}"
             else:
-                line_formatted = f"<{sender_name}> {line}"
-            
+                line_formatted = f"{prefix}<{sender_name}> {line}"
+
             while len(line_formatted) > max_len:
-                self.connection.privmsg(self.config.irc_channel, line_formatted[:max_len])
+                lines_to_send.append(line_formatted[:max_len])
                 line_formatted = line_formatted[max_len:]
-                await asyncio.sleep(self.config.rate_limit_ms / 1000)
-            
+
             if line_formatted:
-                self.connection.privmsg(self.config.irc_channel, line_formatted)
-                await asyncio.sleep(self.config.rate_limit_ms / 1000)
+                lines_to_send.append(line_formatted)
+        return lines_to_send
+
+    async def send_message(self, sender_name: str, text: str, target_name: str = "",
+                           channels: Optional[list[str]] = None, prefix: Optional[str] = None):
+        """Send a message to one or more IRC channels.
+
+        Defaults to the configured default channel when none are given. `prefix`
+        defaults to config.signal_prefix; pass "" for IRC<->IRC mirror echoes.
+        """
+        channels = channels or [self.config.irc_channel]
+        if prefix is None:
+            prefix = self.config.signal_prefix
+        lines_to_send = self._format_lines(
+            sender_name, text, target_name=target_name, prefix=prefix
+        )
+
+        # If connected, send immediately; otherwise queue per channel.
+        connected = self.connection and self.connection.is_connected()
+        for channel in channels:
+            for line in lines_to_send:
+                if connected:
+                    self.connection.privmsg(channel, line)
+                    await asyncio.sleep(self.config.rate_limit_ms / 1000)
+                else:
+                    try:
+                        self._message_queue.put_nowait((channel, line))
+                        self.logger.debug(f"Queued message for {channel} (queue size: {self._message_queue.qsize()})")
+                    except asyncio.QueueFull:
+                        self.logger.warning("Message queue full, dropping message")
     
     async def send_private(self, nick: str, text: str):
         if not self.connection or not self.connection.is_connected():
@@ -529,28 +669,81 @@ class IRCBridge:
                 await asyncio.sleep(1)
     
     def _on_connect(self, connection, event):
+        import time
         self.logger.info("Connected to IRC server")
+        
+        # Clear seen messages on new connection to prevent issues with ZNC replay
+        self._seen_messages.clear()
+        self._last_connect_time = time.time()
+        self.logger.debug("Cleared message deduplication cache for new connection")
+        
         if self.config.irc_nickserv_password:
             connection.privmsg("NickServ", f"IDENTIFY {self.config.irc_nickserv_password}")
             self.logger.info("Sent NickServ identification")
-        connection.join(self.config.irc_channel)
-        self.logger.info(f"Joining {self.config.irc_channel}")
+        for channel in self.config.all_channels():
+            connection.join(channel)
+            self.logger.info(f"Joining {channel}")
         self._connected.set()
+        
+        # Process any queued messages
+        if not self._message_queue.empty():
+            self.logger.info(f"Processing {self._message_queue.qsize()} queued messages")
+            self._loop.create_task(self._process_message_queue())
+    
+    async def _process_message_queue(self):
+        """Send queued messages after reconnection"""
+        while not self._message_queue.empty() and self.connection and self.connection.is_connected():
+            try:
+                channel, message = self._message_queue.get_nowait()
+                self.connection.privmsg(channel, message)
+                await asyncio.sleep(self.config.rate_limit_ms / 1000)
+            except asyncio.QueueEmpty:
+                break
+            except Exception as e:
+                self.logger.error(f"Error sending queued message: {e}")
+                break
     
     def _on_pubmsg(self, connection, event):
         nick = event.source.nick
+        channel = event.target  # the channel the message was sent to
         message = event.arguments[0]
-        
+
+        # Deduplication for ZNC replay - ZNC replays messages on reconnect.
+        # Key on channel too so the same text in different channels isn't dropped.
+        msg_key = f"{channel}:{nick}:{message}"
+
+        # If this exact message was seen recently, skip it (likely ZNC replay)
+        if msg_key in self._seen_messages:
+            self.logger.debug(f"Skipping duplicate message from {nick} (ZNC replay)")
+            return
+
+        # Add to seen messages
+        self._seen_messages.add(msg_key)
+
+        # Keep set manageable - clear old entries periodically
+        if len(self._seen_messages) > 500:
+            # Keep only last 200
+            self._seen_messages = set(list(self._seen_messages)[-200:])
+
+        # Decide what text to relay: either everything (forward_all_messages) or
+        # only messages explicitly addressed to the bot ("<nick>: ...").
         pattern = rf"^{re.escape(self.current_nick)}:\s*(.+)$"
         match = re.match(pattern, message, re.IGNORECASE)
-        
         if match:
             relay_text = match.group(1).strip()
-            self.logger.info(f"IRC relay request from {nick}: {relay_text[:50]}...")
-            if self._message_callback:
-                self._loop.create_task(
-                    self._message_callback(nick, relay_text)
-                )
+        elif self.config.forward_all_messages:
+            relay_text = message.strip()
+        else:
+            return
+
+        if not relay_text:
+            return
+
+        self.logger.info(f"IRC relay request from {nick} in {channel}: {relay_text[:50]}...")
+        if self._message_callback:
+            self._loop.create_task(
+                self._message_callback(channel, nick, relay_text)
+            )
     
     def _on_privmsg(self, connection, event):
         hostmask = str(event.source)
@@ -577,28 +770,98 @@ class IRCBridge:
     
     def _on_kick(self, connection, event):
         if event.arguments[0] == self.current_nick:
-            self.logger.warning(f"Kicked from {event.target}, rejoining...")
-            self._loop.call_later(5, lambda: connection.join(self.config.irc_channel))
+            channel = event.target
+            self.logger.warning(f"Kicked from {channel}, rejoining...")
+            self._loop.call_later(5, lambda: connection.join(channel))
     
     def _on_error(self, connection, event):
         self.logger.error(f"IRC error: {event.arguments}")
     
     async def _reconnect(self):
-        delay = 10
-        max_delay = 300
-        while self._running:
-            self.logger.info(f"Attempting to reconnect in {delay} seconds...")
-            await asyncio.sleep(delay)
-            if not self._running:
-                break
+        # Use lock to prevent multiple reconnection attempts
+        if self._reconnecting:
+            self.logger.debug("Reconnection already in progress, skipping")
+            return
+        
+        async with self._reconnect_lock:
+            self._reconnecting = True
             try:
-                self._loop = asyncio.get_running_loop()
-                self.reactor = irc.client_aio.AioReactor(loop=self._loop)
-                await self.start()
-                return
-            except Exception as e:
-                self.logger.error(f"Reconnection failed: {e}")
-                delay = min(delay * 2, max_delay)
+                # Clean up old connection if it exists
+                if self.connection:
+                    try:
+                        if self.connection.is_connected():
+                            self.connection.quit("Reconnecting")
+                    except Exception:
+                        pass
+                    self.connection = None
+                
+                # Clean up old reactor
+                if self.reactor:
+                    try:
+                        # Close any pending connections
+                        for connection in self.reactor.reactor.connections.values():
+                            try:
+                                connection.close()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    self.reactor = None
+                
+                delay = 5  # Start with shorter delay
+                max_delay = 120  # Cap at 2 minutes
+                
+                while self._running:
+                    self.logger.info(f"Attempting to reconnect in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                    
+                    if not self._running:
+                        break
+                    
+                    try:
+                        # Clear connected event before attempting
+                        self._connected.clear()
+                        
+                        # Re-initialize connection
+                        self._loop = asyncio.get_running_loop()
+                        self.reactor = irc.client_aio.AioReactor(loop=self._loop)
+                        
+                        connect_factory = None
+                        if self.config.irc_use_ssl:
+                            ssl_context = ssl.create_default_context()
+                            if not self.config.irc_verify_ssl:
+                                ssl_context.check_hostname = False
+                                ssl_context.verify_mode = ssl.CERT_NONE
+                            connect_factory = irc.connection.AioFactory(ssl=ssl_context)
+                        
+                        self.connection = await self.reactor.server().connect(
+                            self.config.irc_server,
+                            self.config.irc_port,
+                            self.current_nick,  # Use current_nick in case it was changed
+                            password=self.config.irc_password or None,
+                            connect_factory=connect_factory,
+                        )
+                        
+                        # Re-register event handlers
+                        self.connection.add_global_handler("welcome", self._on_connect)
+                        self.connection.add_global_handler("pubmsg", self._on_pubmsg)
+                        self.connection.add_global_handler("privmsg", self._on_privmsg)
+                        self.connection.add_global_handler("disconnect", self._on_disconnect)
+                        self.connection.add_global_handler("nicknameinuse", self._on_nick_in_use)
+                        self.connection.add_global_handler("kick", self._on_kick)
+                        self.connection.add_global_handler("error", self._on_error)
+                        
+                        self.logger.info("Reconnection successful")
+                        return
+                        
+                    except Exception as e:
+                        self.logger.error(f"Reconnection failed: {e}")
+                        # Clean up failed connection
+                        self.connection = None
+                        self.reactor = None
+                        delay = min(delay * 2, max_delay)
+            finally:
+                self._reconnecting = False
 
 
 class SignalIRCBridge:
@@ -667,19 +930,40 @@ class SignalIRCBridge:
     
     async def _signal_to_irc(self, target: Target, sender_name: str, text: str):
         """
-        Relay Signal message to IRC.
-        
-        If target has a name configured, show as: [TargetName] <sender> message
-        Otherwise just: <sender> message
+        Relay a Signal message to the IRC channel(s) bound to its target.
+
+        If the target has a name configured, show as: [TargetName] <sender> message
+        Otherwise just: <sender> message. A target may map to several channels,
+        in which case the message is mirrored to all of them.
         """
-        self.logger.debug(f"Relaying Signal->IRC: {sender_name}: {text[:50]}...")
-        await self.irc.send_message(sender_name, text, target_name=target.name)
-    
-    async def _irc_to_signal(self, sender: str, text: str):
-        self.logger.debug(f"Relaying IRC->Signal: {sender}: {text[:50]}...")
+        channels = self.config.channels_for_target(target)
+        self.logger.debug(f"Relaying Signal->IRC ({', '.join(channels)}): {sender_name}: {text[:50]}...")
+        await self.irc.send_message(sender_name, text, target_name=target.name, channels=channels)
+
+    async def _irc_to_signal(self, channel: str, sender: str, text: str):
+        """Relay an IRC channel message to the Signal target(s) bound to it.
+
+        Also mirrors the message to any other IRC channels in the same group
+        when mirror_channels is enabled.
+        """
+        targets = self.config.targets_for_channel(channel)
+        if not targets:
+            self.logger.debug(f"IRC->Signal: no target bound to {channel}, ignoring")
+            return
+
         formatted = f"<{sender}> {text}"
-        sent = await self.signal.send_to_all(formatted)
-        self.logger.debug(f"Sent to {sent} targets")
+        sent = 0
+        for target in targets:
+            if await self.signal.send_message(target, formatted):
+                sent += 1
+            await asyncio.sleep(self.config.rate_limit_ms / 1000)
+        self.logger.debug(f"Relayed IRC({channel})->Signal to {sent}/{len(targets)} target(s)")
+
+        # IRC<->IRC mirroring: echo to the other channels in this channel's group.
+        mirror_to = self.config.mirror_channels_for(channel)
+        if mirror_to:
+            self.logger.debug(f"Mirroring IRC msg from {channel} to {', '.join(mirror_to)}")
+            await self.irc.send_message(sender, text, channels=mirror_to, prefix="")
     
     async def _handle_admin(self, nick: str, hostmask: str, message: str):
         if self.config.admin_masks:
@@ -692,9 +976,9 @@ class SignalIRCBridge:
                 await self.irc.send_private(nick, "You are not authorized to use admin commands.")
                 return
 
-        parts = message.split(None, 2)
+        parts = message.split()
         cmd = parts[0].lower() if parts else ""
-        args = parts[1:] if len(parts) > 1 else []
+        args = parts[1:]
 
         handlers = {
             "help": self._cmd_help,
@@ -703,6 +987,7 @@ class SignalIRCBridge:
             "remove": self._cmd_remove,
             "enable": self._cmd_set_enabled,
             "disable": self._cmd_set_enabled,
+            "channels": self._cmd_channels,
             "status": self._cmd_status,
             "save": self._cmd_save,
             "join": self._cmd_join,
@@ -717,16 +1002,17 @@ class SignalIRCBridge:
 
     async def _cmd_help(self, nick: str, _cmd: str, _args: list[str]):
         help_text = """Available commands:
-  help              - Show this help
-  list              - List active targets
-  add <id> [name]   - Add a target (phone or group ID)
-  remove <id>       - Remove a target
-  enable <id>       - Enable a target
-  disable <id>      - Disable a target
-  status            - Show bridge status
-  save              - Save current targets to state file
-  join <channel> [key] - Join an IRC channel (with optional key)
-  part [channel]    - Part an IRC channel (default: current channel)"""
+  help                       - Show this help
+  list                       - List active targets
+  add <id> [name] [#chan...] - Add a target (phone or group ID)
+  remove <id>                - Remove a target
+  enable <id>                - Enable a target
+  disable <id>               - Disable a target
+  channels <id> [#chan...]   - Set/clear a target's IRC channels (none = default)
+  status                     - Show bridge status
+  save                       - Save current targets to state file
+  join <channel> [key]       - Join an IRC channel (with optional key)
+  part [channel]             - Part an IRC channel (default: current channel)"""
         await self.irc.send_private(nick, help_text)
 
     async def _cmd_list(self, nick: str, _cmd: str, _args: list[str]):
@@ -738,26 +1024,35 @@ class SignalIRCBridge:
             status = "enabled" if t.enabled else "disabled"
             type_str = "group" if t.is_group else "contact"
             name_str = f" ({t.name})" if t.name else ""
+            chans = " ".join(self.config.channels_for_target(t))
             stats = f"msgs={t.message_count}"
             if t.last_message:
                 stats += f", last={t.last_message.strftime('%H:%M:%S')}"
-            await self.irc.send_private(nick, f"  {t.id}{name_str} [{type_str}] [{status}] {stats}")
+            await self.irc.send_private(nick, f"  {t.id}{name_str} [{type_str}] [{status}] -> {chans} {stats}")
 
     async def _cmd_add(self, nick: str, _cmd: str, args: list[str]):
         if not args:
-            await self.irc.send_private(nick, "Usage: add <id> [name]")
+            await self.irc.send_private(nick, "Usage: add <id> [name] [#chan...]")
             return
         target_id = args[0]
-        target_name = args[1] if len(args) > 1 else ""
+        # Tokens starting with '#' are channels; the first other token is the name.
+        channels = [a for a in args[1:] if a.startswith("#")]
+        names = [a for a in args[1:] if not a.startswith("#")]
+        target_name = names[0] if names else ""
         if target_id in self.config.targets:
             await self.irc.send_private(nick, f"Target {target_id} already exists.")
             return
-        target = Target(id=target_id, name=target_name)
+        target = Target(id=target_id, name=target_name, channels=channels)
         self.config.add_target(target)
         self.config.save_state()
+        # Join any newly-referenced channels so the bridge is live immediately.
+        for chan in channels:
+            if self.irc.connection and self.irc.connection.is_connected():
+                self.irc.connection.join(chan)
         display = f"{target_id} ({target_name})" if target_name else target_id
-        await self.irc.send_private(nick, f"Added target: {display}")
-        self.logger.info(f"Admin {nick} added target: {display}")
+        chan_str = f" -> {' '.join(channels)}" if channels else ""
+        await self.irc.send_private(nick, f"Added target: {display}{chan_str}")
+        self.logger.info(f"Admin {nick} added target: {display}{chan_str}")
 
     async def _cmd_remove(self, nick: str, _cmd: str, args: list[str]):
         if not args:
@@ -784,6 +1079,26 @@ class SignalIRCBridge:
         self.config.save_state()
         label = "Enabled" if enable else "Disabled"
         await self.irc.send_private(nick, f"{label} target: {target_id}")
+
+    async def _cmd_channels(self, nick: str, _cmd: str, args: list[str]):
+        if not args:
+            await self.irc.send_private(nick, "Usage: channels <id> [#chan...] (no channels = default)")
+            return
+        target_id = args[0]
+        if target_id not in self.config.targets:
+            await self.irc.send_private(nick, f"Target not found: {target_id}")
+            return
+        channels = [a for a in args[1:] if a.startswith("#")]
+        target = self.config.targets[target_id]
+        target.channels = channels
+        self.config.save_state()
+        # Join any newly-referenced channels right away.
+        if self.irc.connection and self.irc.connection.is_connected():
+            for chan in channels:
+                self.irc.connection.join(chan)
+        effective = " ".join(self.config.channels_for_target(target))
+        await self.irc.send_private(nick, f"{target_id} now bridges: {effective}")
+        self.logger.info(f"Admin {nick} set channels for {target_id}: {effective}")
 
     async def _cmd_status(self, nick: str, _cmd: str, _args: list[str]):
         uptime = datetime.now() - self._start_time if self._start_time else "N/A"
@@ -824,37 +1139,48 @@ def main():
 Environment Variables:
   SIGNAL_API_URL          signal-cli-rest-api URL (default: http://localhost:8080)
   SIGNAL_PHONE_NUMBER     Your Signal phone number
-  SIGNAL_TARGETS          Comma-separated target IDs to bridge
-  
+  SIGNAL_TARGETS          Comma-separated target IDs to bridge. Append
+                          "@#chan1+#chan2" to bind a target to channels.
+
   IRC_SERVER              IRC server hostname (default: irc.libera.chat)
   IRC_PORT                IRC server port (default: 6697)
   IRC_USE_SSL             Use SSL/TLS (default: true)
   IRC_VERIFY_SSL          Verify SSL certificate (default: true)
   IRC_NICK                Bot nickname (default: SignalBridge)
-  IRC_CHANNEL             Channel to join (default: #signal-bridge)
-  
+  IRC_CHANNEL             Default channel to join (default: #signal-bridge)
+
+  SIGNAL_PREFIX           Prefix prepended to Signal -> IRC messages
+  FORWARD_ALL_MESSAGES    Forward every IRC message to Signal (default: false)
+  MIRROR_CHANNELS         Echo IRC messages between a target's channels (default: false)
   ADMIN_MASKS             Comma-separated IRC hostmasks for admin access
 
 Example config.ini:
   [signal]
   api_url = http://localhost:8080
   phone_number = +1234567890
-  
+
   [irc]
   server = irc.example.com
   port = 6697
   nick = SignalBridge
-  channel = #mychannel
-  
+  channel = #signal-bridge      ; default channel for targets without one
+
+  [bridge]
+  forward_all_messages = false  ; true = relay all IRC msgs, not just "nick:"
+  mirror_channels = false       ; true = mirror IRC msgs across a target's channels
+
   [admin]
   masks = *!~user@your.host.com
-  
+
   [targets]
-  ; Just the ID - sender's Signal name will be shown
-  +18005551212 = ExamplePerson
-  
-  ; Group with a nickname - shown as [FamilyChat] <sender> message
-  group.abc123== = internal:xyzPDQ= group, FamilyChat
+  ; Just the ID - relays to the default channel, sender's Signal name shown
+  +15551234567 =
+
+  ; A group with a friendly name, bridged to one specific channel
+  group.abc123== = group, FamilyChat, channels:#family
+
+  ; Mirror one Signal group across several IRC channels
+  group.def456== = group, channels:#mirror-a #mirror-b
 """
     )
     
@@ -862,15 +1188,24 @@ Example config.ini:
     parser.add_argument("-l", "--loglevel", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                         help="Set log level (default: INFO)")
+    parser.add_argument("-s", "--silent", action="store_true",
+                        help="Silent mode - suppress all console output")
 
     args = parser.parse_args()
 
     log_level = getattr(logging, args.loglevel)
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
+    if args.silent:
+        logging.basicConfig(
+            level=logging.CRITICAL + 1,  # Disable all logging
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+    else:
+        logging.basicConfig(
+            level=log_level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
     
     if args.config:
         config = Config.from_file(args.config)
